@@ -732,7 +732,7 @@ def shell(title, body, active="dashboard"):
         ("analytics","📊 Analytics / BI","analytics"),
         ("notifications","🔔 Notifications","notifications"),
         ("users","👥 Users","users"),
-        ("audit_page","🕒 Audit Trail","audit"),
+       ("audit_page","🕒 Audit Trail","audit_page"),
         ("storage","💾 Storage","storage"),
         ("search_pro","🔎 Smart Search","smart_search"),
         ("revisions","🧬 Revisions","revisions"),
