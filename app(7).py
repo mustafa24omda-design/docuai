@@ -1,4 +1,4 @@
-Python
+"""
 DocuAI - Intelligent Project Document Management System
 =========================================================
 نسخة مدمجة بالكامل في ملف واحد (app.py) — بدون الحاجة لمجلدات فرعية،
