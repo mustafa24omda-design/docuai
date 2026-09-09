@@ -21,12 +21,9 @@ from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-# Data Analytics
-try:
-    import pandas as pd
-except ImportError:
-    pd = None
+from flask import Flask, request, render_template_string, send_file, jsonify
 
+# OCR is loaded lazily so the app can still start when OCR dependencies are missing.
 
 
 # =============================================================================
@@ -190,11 +187,70 @@ def extract_fields(text: str, source_file: str = "") -> ExtractedDocument:
 # =============================================================================
 
 def read_pdf(path: str) -> str:
+    """
+    Read a PDF. First try normal text extraction. If a page has little/no
+    selectable text, OCR the page using Tesseract.
+
+    OCR requirements:
+      pip install pytesseract pdf2image pillow
+    Also install the Tesseract OCR engine on the operating system.
+    """
     import pdfplumber
+
     text_parts = []
+    pages_needing_ocr = []
+
+    # 1) Fast path: extract selectable PDF text.
     with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            text_parts.append(page.extract_text() or "")
+        for page_no, page in enumerate(pdf.pages, start=1):
+            extracted = (page.extract_text() or "").strip()
+            text_parts.append(extracted)
+            if len(extracted) < 20:
+                pages_needing_ocr.append(page_no)
+
+    # 2) OCR only pages that appear scanned/image-only.
+    if pages_needing_ocr:
+        try:
+            import pytesseract
+            from pdf2image import convert_from_path
+        except ImportError as exc:
+            raise RuntimeError(
+                "هذا الـPDF يحتوي صفحات ممسوحة ضوئياً وتحتاج OCR. "
+                "ثبّت: pip install pytesseract pdf2image pillow"
+            ) from exc
+
+        try:
+            images = convert_from_path(
+                path,
+                dpi=250,
+                first_page=min(pages_needing_ocr),
+                last_page=max(pages_needing_ocr)
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "تعذر تحويل صفحات PDF إلى صور. تأكد من تثبيت Poppler "
+                "وإضافته إلى PATH في Windows."
+            ) from exc
+
+        for index, page_no in enumerate(range(min(pages_needing_ocr), max(pages_needing_ocr) + 1)):
+            if page_no not in pages_needing_ocr:
+                continue
+
+            image = images[index]
+            try:
+                # Arabic + English OCR. If ara is unavailable, fall back to English.
+                langs = "eng+ara"
+                try:
+                    ocr_text = pytesseract.image_to_string(image, lang=langs)
+                except Exception:
+                    ocr_text = pytesseract.image_to_string(image, lang="eng")
+
+                text_parts[page_no - 1] = ocr_text.strip()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"فشل OCR في الصفحة {page_no}: {exc}"
+                ) from exc
+
     return "\n".join(text_parts)
 
 
@@ -270,622 +326,1044 @@ def export_to_excel(results, output_path: str):
 
 
 
-
 # =============================================================================
-# 4) طبقة تحليل البيانات وذكاء الأعمال
-# =============================================================================
-
-def documents_dataframe():
-    """Convert processed documents to a pandas DataFrame."""
-    if pd is None:
-        return None
-    rows = [r.to_dict() for r in DOCUMENTS]
-    if not rows:
-        return pd.DataFrame(columns=[
-            "source_file", "document_number", "document_type",
-            "date", "revision", "status", "sender", "confidence"
-        ])
-    df = pd.DataFrame(rows)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    return df
-
-
-def export_powerbi_dataset(output_path: str):
-    """Create a clean CSV dataset ready for Power BI."""
-    if pd is None:
-        raise RuntimeError("pandas غير مثبتة. أضف pandas إلى requirements.txt")
-    df = documents_dataframe()
-    df = df.copy()
-    if "date" in df.columns:
-        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-    df.to_csv(output_path, index=False, encoding="utf-8-sig")
-
-
-def analyze_tabular_file(path: str):
-    """
-    Analyze business data files such as CSV/XLSX.
-    Returns a compact analytical summary and DataFrame.
-    """
-    if pd is None:
-        raise RuntimeError("pandas غير مثبتة")
-    ext = Path(path).suffix.lower()
-    if ext == ".csv":
-        df = pd.read_csv(path)
-    elif ext in {".xlsx", ".xls"}:
-        df = pd.read_excel(path)
-    else:
-        raise ValueError("تحليل البيانات يدعم CSV و Excel حالياً")
-
-    df.columns = [str(c).strip() for c in df.columns]
-
-    numeric = df.select_dtypes(include="number").columns.tolist()
-    date_cols = []
-    for col in df.columns:
-        if df[col].dtype == "object":
-            converted = pd.to_datetime(df[col], errors="coerce")
-            if converted.notna().mean() >= 0.7:
-                df[col] = converted
-                date_cols.append(col)
-        elif pd.api.types.is_datetime64_any_dtype(df[col]):
-            date_cols.append(col)
-
-    summary = {
-        "rows": int(len(df)),
-        "columns": int(len(df.columns)),
-        "numeric_columns": numeric,
-        "date_columns": date_cols,
-        "missing_cells": int(df.isna().sum().sum()),
-    }
-
-    # Common sales/business metrics when recognizable columns exist.
-    lowered = {c.lower(): c for c in df.columns}
-    sales_col = next(
-        (lowered[k] for k in ["sales", "revenue", "amount", "total", "المبيعات", "الإيراد", "المبلغ"] if k in lowered),
-        None,
-    )
-    quantity_col = next(
-        (lowered[k] for k in ["quantity", "qty", "units", "الكمية", "الوحدات"] if k in lowered),
-        None,
-    )
-    summary["sales_column"] = sales_col
-    summary["quantity_column"] = quantity_col
-    summary["total_sales"] = float(df[sales_col].sum()) if sales_col else None
-    summary["total_quantity"] = float(df[quantity_col].sum()) if quantity_col else None
-
-    return df, summary
-
-
-DATASET_INFO = {"name": None, "summary": None, "preview": []}
-
-# =============================================================================
-# 4) واجهة الويب الاحترافية (Flask)
+# MD DocuAI Professional — Single-file Project Document Management Platform
+# V2/V3/V4 foundation: Login, Dashboard, Documents, OCR, Projects, Workflow,
+# Transmittals, RFIs, Submittals, BI, Notifications, Audit Trail, Multi-Company,
+# Cloud-ready storage and REST API.
 # =============================================================================
 
-from flask import Flask, request, render_template_string, send_file, jsonify
+import json
+import secrets
+import sqlite3
+from functools import wraps
+from flask import (
+    Flask, request, render_template_string, redirect, url_for,
+    session, send_file, jsonify, flash
+)
+from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("DOCUAI_SECRET_KEY", "change-this-secret-key")
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
-UPLOAD_DIR = Path(tempfile.gettempdir()) / "docuai_uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path(os.environ.get("DOCUAI_DATA_DIR", "./data"))
+STORAGE_DIR = Path(os.environ.get("DOCUAI_STORAGE_DIR", str(BASE_DIR / "storage")))
+DB_PATH = Path(os.environ.get("DOCUAI_DB_PATH", str(BASE_DIR / "docuai.db")))
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-LAST_RESULTS = []
-DOCUMENTS = []
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 
+# ---------- Database ----------
 
-# ---------------------------------------------------------------------------
-# UI helpers
-# ---------------------------------------------------------------------------
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
 
-ICON = {
-    "dashboard": "▦",
-    "documents": "▤",
-    "upload": "↑",
-    "reports": "▥",
-    "settings": "⚙",
-    "search": "⌕",
-    "file": "▱",
-    "check": "✓",
-    "clock": "◷",
-    "warning": "!",
-    "cloud": "☁",
-    "download": "↓",
-    "menu": "☰",
-}
+def init_db():
+    con = db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS companies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        code TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    );
 
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'Viewer',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(company_id) REFERENCES companies(id)
+    );
 
-ANALYTICS_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DocuAI | Analytics & BI</title>
-<style>
-:root{--navy:#102a43;--blue:#1769aa;--bg:#f5f7fb;--card:#fff;--line:#e5eaf0;--muted:#68778a;--green:#198754}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:"Segoe UI",Tahoma,Arial;color:#172b4d}
-.wrap{max-width:1350px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}
-h1{margin:0;font-size:26px}.sub{color:var(--muted);font-size:13px;margin-top:6px}
-.btn{background:var(--blue);color:#fff;text-decoration:none;border:0;border-radius:9px;padding:11px 16px;cursor:pointer;font-weight:600}
-.btn.alt{background:#eaf3fb;color:var(--blue)}
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}.card{background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 6px 22px rgba(16,42,67,.06)}
-.stat{padding:19px}.label{font-size:12px;color:var(--muted)}.num{font-size:26px;font-weight:750;margin-top:6px}
-.panel{padding:20px;margin-top:18px}.panel h3{margin:0 0 15px}
-.upload{border:2px dashed #b9cce0;padding:30px;text-align:center;border-radius:12px;background:#fbfdff}
-input[type=file]{margin:14px 0}.grid{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}
-.table-wrap{overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:10px;border-bottom:1px solid #edf0f4;text-align:right;font-size:12px;white-space:nowrap}.table th{background:#f8fafc}
-.pill{display:inline-block;padding:5px 10px;background:#eaf7f0;color:var(--green);border-radius:20px;font-size:11px;font-weight:700}
-.metric{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #edf0f4}.metric:last-child{border:0}
-.note{background:#eef7ff;border-right:4px solid var(--blue);padding:13px;border-radius:8px;font-size:13px;line-height:1.7}
-@media(max-width:900px){.cards{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}}
-@media(max-width:600px){.wrap{padding:16px}.cards{grid-template-columns:1fr}.top{align-items:flex-start;gap:10px;flex-direction:column}}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="top">
-    <div><h1>📊 مركز تحليل البيانات وذكاء الأعمال</h1>
-      <div class="sub">تحليل Excel وCSV وبناء مؤشرات تساعدك على اتخاذ القرار</div></div>
-    <div>
-      <a class="btn alt" href="/">← DocuAI</a>
-      {% if powerbi_ready %}<a class="btn" href="/powerbi-dataset">⬇ Power BI Dataset</a>{% endif %}
-    </div>
-  </div>
+    CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        code TEXT NOT NULL,
+        client TEXT,
+        status TEXT NOT NULL DEFAULT 'Active',
+        created_at TEXT NOT NULL,
+        UNIQUE(company_id, code),
+        FOREIGN KEY(company_id) REFERENCES companies(id)
+    );
 
-  <div class="card panel">
-    <h3>📥 استيراد بيانات المبيعات أو أي بيانات تشغيلية</h3>
-    <form method="POST" enctype="multipart/form-data">
-      <div class="upload">
-        <strong>ارفع ملف Excel أو CSV</strong><br>
-        <small style="color:#68778a">مثال: Sales, Revenue, Quantity, Date, Product, Region, Customer</small><br>
-        <input type="file" name="data_file" accept=".csv,.xlsx,.xls" required>
-        <br><button class="btn" type="submit">🤖 تحليل البيانات</button>
-      </div>
-    </form>
-  </div>
+    CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        project_id INTEGER,
+        uid TEXT NOT NULL UNIQUE,
+        filename TEXT NOT NULL,
+        stored_name TEXT NOT NULL,
+        document_number TEXT,
+        document_type TEXT,
+        issue_date TEXT,
+        revision TEXT,
+        status TEXT NOT NULL DEFAULT 'Uploaded',
+        sender TEXT,
+        confidence TEXT,
+        ocr_used INTEGER NOT NULL DEFAULT 0,
+        workflow_status TEXT NOT NULL DEFAULT 'Draft',
+        file_size INTEGER DEFAULT 0,
+        uploaded_by INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(company_id) REFERENCES companies(id),
+        FOREIGN KEY(project_id) REFERENCES projects(id),
+        FOREIGN KEY(uploaded_by) REFERENCES users(id)
+    );
 
-  {% if dataset_name %}
-  <div class="note" style="margin-top:18px">
-    تم تحليل <strong>{{ dataset_name }}</strong>.
-    النظام اكتشف {{ rows }} صف و{{ cols }} عمود و{{ missing }} خلية فارغة.
-    <span class="pill">Dataset جاهز للتحليل</span>
-  </div>
+    CREATE TABLE IF NOT EXISTS transmittals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        project_id INTEGER,
+        number TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        to_company TEXT,
+        status TEXT NOT NULL DEFAULT 'Draft',
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        UNIQUE(company_id, number),
+        FOREIGN KEY(company_id) REFERENCES companies(id),
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
 
-  <div class="cards" style="margin-top:18px">
-    <div class="card stat"><div class="label">عدد الصفوف</div><div class="num">{{ rows }}</div></div>
-    <div class="card stat"><div class="label">عدد الأعمدة</div><div class="num">{{ cols }}</div></div>
-    <div class="card stat"><div class="label">إجمالي المبيعات</div><div class="num">{{ total_sales if total_sales is not none else '—' }}</div></div>
-    <div class="card stat"><div class="label">إجمالي الكمية</div><div class="num">{{ total_quantity if total_quantity is not none else '—' }}</div></div>
-  </div>
+    CREATE TABLE IF NOT EXISTS rfis (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        project_id INTEGER,
+        number TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        question TEXT,
+        status TEXT NOT NULL DEFAULT 'Open',
+        priority TEXT NOT NULL DEFAULT 'Normal',
+        due_date TEXT,
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        UNIQUE(company_id, number),
+        FOREIGN KEY(company_id) REFERENCES companies(id),
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
 
-  <div class="grid">
-    <div class="card panel">
-      <h3>🔎 معاينة البيانات</h3>
-      {% if preview %}
-      <div class="table-wrap"><table class="table">
-        <thead><tr>{% for c in columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
-        <tbody>{% for row in preview %}<tr>{% for c in columns %}<td>{{ row[c] }}</td>{% endfor %}</tr>{% endfor %}</tbody>
-      </table></div>
-      {% endif %}
-    </div>
-    <div class="card panel">
-      <h3>🧠 تحليل ذكي</h3>
-      <div class="metric"><span>الأعمدة الرقمية</span><strong>{{ columns|length }}</strong></div>
-      <div class="metric"><span>مبيعات مكتشفة</span><strong>{{ 'نعم' if total_sales is not none else 'لا' }}</strong></div>
-      <div class="metric"><span>كمية مكتشفة</span><strong>{{ 'نعم' if total_quantity is not none else 'لا' }}</strong></div>
-      <div class="metric"><span>حالة البيانات</span><span class="pill">جاهزة</span></div>
-      <p class="sub">يمكن فتح ملف Power BI Dataset في Power BI Desktop وإنشاء الرسوم والمؤشرات والتقارير التفاعلية.</p>
-    </div>
-  </div>
-  {% endif %}
+    CREATE TABLE IF NOT EXISTS submittals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        project_id INTEGER,
+        number TEXT NOT NULL,
+        title TEXT NOT NULL,
+        type TEXT,
+        status TEXT NOT NULL DEFAULT 'Submitted',
+        revision TEXT,
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        UNIQUE(company_id, number),
+        FOREIGN KEY(company_id) REFERENCES companies(id),
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
 
-  <div class="card panel">
-    <h3>💼 سيناريوهات التحليل</h3>
-    <div class="grid">
-      <div>
-        <div class="metric"><span>📈 المبيعات والإيرادات</span><strong>Trend / KPI</strong></div>
-        <div class="metric"><span>🏆 أفضل المنتجات والعملاء</span><strong>Ranking</strong></div>
-        <div class="metric"><span>🌍 المناطق والفروع</span><strong>Comparison</strong></div>
-        <div class="metric"><span>📅 الأداء الشهري والسنوي</span><strong>Time Series</strong></div>
-      </div>
-      <div>
-        <div class="note">النسخة الحالية تجهز البيانات والتحليل داخل DocuAI، مع تصدير Dataset نظيف إلى Power BI. يمكن في المرحلة التالية إضافة رسوم تفاعلية داخل الموقع وربط Power BI Service مباشرة.</div>
-      </div>
-    </div>
-  </div>
-</div>
-</body>
-</html>
-"""
+    CREATE TABLE IF NOT EXISTS workflow (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        from_status TEXT,
+        to_status TEXT,
+        comment TEXT,
+        user_id INTEGER,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    );
 
-PAGE_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DocuAI | Intelligent Document Management</title>
-<style>
-:root{
-  --navy:#102a43; --blue:#1769aa; --blue2:#2f80c9;
-  --bg:#f5f7fb; --card:#fff; --text:#172b4d; --muted:#6b778c;
-  --line:#e6eaf0; --green:#1f9d68; --orange:#e69b25; --red:#d64545;
-  --shadow:0 8px 28px rgba(16,42,67,.08);
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI",Tahoma,Arial,sans-serif}
-button,input{font:inherit}
-.layout{display:flex;min-height:100vh}
-.sidebar{
-  width:245px;background:linear-gradient(180deg,#0d253d,#123a5b);
-  color:#fff;padding:22px 14px;position:fixed;right:0;top:0;bottom:0;
-  z-index:20
-}
-.brand{display:flex;align-items:center;gap:12px;padding:8px 12px 25px}
-.logo{
-  width:44px;height:44px;border-radius:12px;background:#fff;color:var(--blue);
-  display:grid;place-items:center;font-weight:800;font-size:22px;box-shadow:0 5px 18px rgba(0,0,0,.15)
-}
-.brand strong{font-size:20px;display:block}.brand small{opacity:.7}
-.nav-title{font-size:11px;opacity:.55;padding:18px 13px 7px}
-.nav a{
-  color:#dbe8f4;text-decoration:none;display:flex;align-items:center;gap:12px;
-  padding:12px 13px;border-radius:10px;margin:4px 0;font-size:14px
-}
-.nav a:hover,.nav a.active{background:rgba(255,255,255,.12);color:#fff}
-.nav .ico{width:23px;text-align:center;font-size:18px}
-.side-bottom{position:absolute;bottom:18px;right:14px;left:14px}
-.main{margin-right:245px;width:calc(100% - 245px)}
-.topbar{
-  height:72px;background:#fff;border-bottom:1px solid var(--line);
-  display:flex;align-items:center;justify-content:space-between;padding:0 30px;
-  position:sticky;top:0;z-index:10
-}
-.search{width:min(430px,50%);position:relative}
-.search input{
-  width:100%;border:1px solid var(--line);background:#f8fafc;border-radius:10px;
-  padding:11px 42px 11px 14px;outline:none
-}
-.search span{position:absolute;right:14px;top:9px;font-size:20px;color:var(--muted)}
-.user{display:flex;align-items:center;gap:10px}.avatar{
-  width:38px;height:38px;border-radius:50%;background:#e8f2fb;color:var(--blue);
-  display:grid;place-items:center;font-weight:700
-}
-.content{padding:28px 30px 45px;max-width:1400px;margin:auto}
-.page-head{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:25px}
-.page-head h1{margin:0;font-size:25px}.page-head p{margin:6px 0 0;color:var(--muted);font-size:13px}
-.btn{
-  border:0;border-radius:9px;padding:11px 18px;cursor:pointer;font-weight:600;
-  background:var(--blue);color:#fff;display:inline-flex;gap:8px;align-items:center
-}
-.btn:hover{background:#12588e}.btn.secondary{background:#edf4fa;color:var(--blue)}
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:22px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
-.stat{padding:20px;display:flex;justify-content:space-between;align-items:center}
-.stat .num{font-size:28px;font-weight:750;margin-top:5px}.stat .label{color:var(--muted);font-size:13px}
-.stat .ico-box{width:48px;height:48px;border-radius:12px;background:#edf5fc;color:var(--blue);display:grid;place-items:center;font-size:23px}
-.grid2{display:grid;grid-template-columns:1.5fr 1fr;gap:18px}
-.panel{padding:20px}.panel h3{margin:0 0 17px;font-size:17px}
-.upload{
-  border:2px dashed #b9cce0;border-radius:13px;padding:32px 20px;text-align:center;
-  background:#fbfdff;transition:.2s
-}
-.upload.drag{border-color:var(--blue);background:#f1f8ff}
-.upload .big{font-size:38px;color:var(--blue);margin-bottom:7px}
-.upload p{color:var(--muted);margin:6px 0 16px;font-size:13px}
-input[type=file]{display:none}
-.drop-label{display:inline-flex}
-.mini-list{display:flex;flex-direction:column;gap:10px}
-.mini-row{display:flex;align-items:center;gap:10px;padding:11px;border-bottom:1px solid #f0f2f5}
-.file-ico{width:37px;height:37px;border-radius:9px;background:#eef5fb;color:var(--blue);display:grid;place-items:center}
-.mini-row .name{font-size:13px;font-weight:600}.mini-row small{color:var(--muted)}
-.badge{padding:4px 9px;border-radius:20px;font-size:11px;font-weight:700;margin-right:auto}
-.High{background:#e8f7ef;color:var(--green)}.Medium{background:#fff4dd;color:#a66b00}.Low{background:#fdeaea;color:var(--red)}
-.table-wrap{overflow:auto}.table{width:100%;border-collapse:collapse}
-.table th,.table td{padding:13px 11px;border-bottom:1px solid #eef1f5;text-align:right;white-space:nowrap;font-size:13px}
-.table th{background:#f8fafc;color:#5c6b7c;font-weight:700}
-.empty{text-align:center;padding:35px;color:var(--muted)}
-.notice{padding:12px 15px;background:#eef7ff;border-right:4px solid var(--blue);border-radius:8px;margin-bottom:18px;font-size:13px}
-.footer{text-align:center;color:#98a2b3;font-size:11px;margin-top:35px}
-.mobile-menu{display:none;border:0;background:none;font-size:24px;color:var(--text)}
-@media(max-width:1000px){
-  .sidebar{width:215px}.main{margin-right:215px;width:calc(100% - 215px)}
-  .cards{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}
-}
-@media(max-width:720px){
-  .sidebar{transform:translateX(100%);transition:.25s}.sidebar.open{transform:translateX(0)}
-  .main{margin-right:0;width:100%}.mobile-menu{display:block}
-  .topbar{padding:0 16px}.search{display:none}.content{padding:20px 15px}
-  .cards{grid-template-columns:1fr 1fr}.page-head{align-items:flex-start;flex-direction:column}
-}
-</style>
-</head>
-<body>
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        is_read INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    );
 
-<aside class="sidebar" id="sidebar">
-  <div class="brand">
-    <div class="logo">D</div>
-    <div><strong>DocuAI</strong><small>Smart Document System</small></div>
-  </div>
-  <div class="nav-title">MAIN MENU</div>
-  <nav class="nav">
-    <a href="/" class="active"><span class="ico">▦</span>لوحة التحكم</a>
-    <a href="/documents"><span class="ico">▤</span>المستندات</a>
-    <a href="/upload"><span class="ico">↑</span>رفع مستندات</a>
-    <a href="/reports"><span class="ico">▥</span>التقارير</a>
-    <a href="/analytics"><span class="ico">📊</span>تحليل البيانات BI</a>
-  </nav>
-  <div class="nav-title">SYSTEM</div>
-  <nav class="nav"><a href="#"><span class="ico">⚙</span>الإعدادات</a></nav>
-  <div class="side-bottom">
-    <div style="font-size:11px;opacity:.6;padding:10px">DocuAI v2.0 • 2026</div>
-  </div>
-</aside>
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action TEXT NOT NULL,
+        entity_type TEXT,
+        entity_id INTEGER,
+        details TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    );
 
-<main class="main">
-  <header class="topbar">
-    <div style="display:flex;align-items:center;gap:12px">
-      <button class="mobile-menu" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
-      <div class="search"><span>⌕</span><input placeholder="ابحث عن مستند..." oninput="filterTable(this.value)"></div>
-    </div>
-    <div class="user"><div><strong style="font-size:13px">Document Control</strong><br><small style="color:#7b8794">Workspace</small></div><div class="avatar">DC</div></div>
-  </header>
+    CREATE INDEX IF NOT EXISTS idx_documents_company ON documents(company_id);
+    CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
+    CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
+    CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(document_type);
+    CREATE INDEX IF NOT EXISTS idx_documents_number ON documents(document_number);
+    """)
+    if con.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 0:
+        con.execute(
+            "INSERT INTO companies(name,code,created_at) VALUES(?,?,?)",
+            ("MD Demo Company", "MD", now())
+        )
+    if con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        company_id = con.execute("SELECT id FROM companies ORDER BY id LIMIT 1").fetchone()["id"]
+        con.execute(
+            """INSERT INTO users(company_id,username,password_hash,full_name,role,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (company_id, "admin", generate_password_hash("Admin@123"),
+             "MD Administrator", "Administrator", now())
+        )
 
-  <section class="content">
-    <div class="page-head">
-      <div><h1>لوحة التحكم</h1><p>مرحباً بك في DocuAI — نظام إدارة وتحليل المستندات الذكي</p></div>
-      <a class="btn" href="/upload">＋ رفع مستند</a>
-    </div>
+    # ---------------- Advanced platform tables (V5-V18 foundation) ----------------
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS document_revisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL,
+        revision TEXT NOT NULL,
+        file_uid TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'Draft',
+        change_summary TEXT,
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    );
+    CREATE TABLE IF NOT EXISTS document_comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL,
+        user_id INTEGER,
+        comment TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    );
+    CREATE TABLE IF NOT EXISTS workflow_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL,
+        assigned_to INTEGER,
+        stage TEXT NOT NULL,
+        due_date TEXT,
+        status TEXT NOT NULL DEFAULT 'Pending',
+        decision TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    );
+    CREATE TABLE IF NOT EXISTS transmittal_documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        transmittal_id INTEGER NOT NULL,
+        document_id INTEGER NOT NULL,
+        FOREIGN KEY(transmittal_id) REFERENCES transmittals(id),
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    );
+    CREATE TABLE IF NOT EXISTS rfi_responses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rfi_id INTEGER NOT NULL,
+        user_id INTEGER,
+        response TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(rfi_id) REFERENCES rfis(id)
+    );
+    CREATE TABLE IF NOT EXISTS submittal_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        submittal_id INTEGER NOT NULL,
+        user_id INTEGER,
+        decision TEXT NOT NULL,
+        comments TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(submittal_id) REFERENCES submittals(id)
+    );
+    CREATE TABLE IF NOT EXISTS internal_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+        receiver_id INTEGER NOT NULL,
+        subject TEXT NOT NULL,
+        body TEXT NOT NULL,
+        is_read INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS signatures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        signature_type TEXT NOT NULL DEFAULT 'Electronic Approval',
+        signed_at TEXT NOT NULL,
+        note TEXT
+    );
+    CREATE TABLE IF NOT EXISTS saved_searches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        query TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ai_analysis (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL,
+        summary TEXT,
+        key_points TEXT,
+        required_actions TEXT,
+        risks TEXT,
+        keywords TEXT,
+        model TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    );
+    CREATE TABLE IF NOT EXISTS system_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        setting_key TEXT NOT NULL,
+        setting_value TEXT,
+        UNIQUE(company_id, setting_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_revisions_document ON document_revisions(document_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_document ON document_comments(document_id);
+    CREATE INDEX IF NOT EXISTS idx_tasks_document ON workflow_tasks(document_id);
+    CREATE INDEX IF NOT EXISTS idx_ai_document ON ai_analysis(document_id);
+    """)
+    con.commit()
+    con.close()
 
-    <div class="cards">
-      <div class="card stat"><div><div class="label">إجمالي المستندات</div><div class="num">{{ total }}</div></div><div class="ico-box">▤</div></div>
-      <div class="card stat"><div><div class="label">تم تحليلها</div><div class="num">{{ analyzed }}</div></div><div class="ico-box">✓</div></div>
-      <div class="card stat"><div><div class="label">دقة عالية</div><div class="num">{{ high }}</div></div><div class="ico-box">◉</div></div>
-      <div class="card stat"><div><div class="label">ملفات اليوم</div><div class="num">{{ today }}</div></div><div class="ico-box">◷</div></div>
-    </div>
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    <div class="grid2">
-      <div class="card panel">
-        <h3>رفع وتحليل المستندات</h3>
-        <form method="POST" enctype="multipart/form-data" action="/upload">
-          <div class="upload" id="drop">
-            <div class="big">↑</div>
-            <strong>اسحب الملفات هنا أو اختر من جهازك</strong>
-            <p>PDF / DOCX / TXT — حتى 25 MB لكل طلب</p>
-            <label class="btn drop-label">اختيار الملفات
-              <input type="file" name="files" multiple required onchange="showNames(this)">
-            </label>
-            <div id="names" style="margin-top:12px;color:#6b778c;font-size:12px"></div>
-          </div>
-          <button class="btn" style="margin-top:13px;width:100%;justify-content:center" type="submit">🤖 تحليل المستندات</button>
-        </form>
-      </div>
+def current_user():
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    con = db()
+    row = con.execute("""
+        SELECT u.*, c.name AS company_name, c.code AS company_code
+        FROM users u LEFT JOIN companies c ON c.id=u.company_id
+        WHERE u.id=? AND u.active=1
+    """, (uid,)).fetchone()
+    con.close()
+    return row
 
-      <div class="card panel">
-        <h3>الأنواع المدعومة</h3>
-        <div class="mini-list">
-          {% for t in types %}
-          <div class="mini-row"><div class="file-ico">▱</div><div><div class="name">{{ t }}</div><small>تصنيف تلقائي</small></div><span style="color:#2f80c9">✓</span></div>
-          {% endfor %}
-        </div>
-      </div>
-    </div>
-
-    <div class="card panel" style="margin-top:18px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
-        <h3 style="margin:0">آخر المستندات</h3>
-        <a href="/documents" class="btn secondary">عرض الكل</a>
-      </div>
-      {% if results %}
-      <div class="table-wrap">
-      <table class="table" id="docsTable">
-        <thead><tr><th>الملف</th><th>رقم المستند</th><th>النوع</th><th>التاريخ</th><th>Revision</th><th>Status</th><th>الثقة</th></tr></thead>
-        <tbody>
-        {% for r in results %}
-        <tr>
-          <td>{{ r.source_file }}</td><td>{{ r.document_number or '—' }}</td><td>{{ r.document_type or '—' }}</td>
-          <td>{{ r.date or '—' }}</td><td>{{ r.revision or '—' }}</td><td>{{ r.status or '—' }}</td>
-          <td><span class="badge {{ r.confidence }}">{{ r.confidence }}</span></td>
-        </tr>
-        {% endfor %}
-        </tbody>
-      </table></div>
-      {% else %}
-        <div class="empty">لا توجد مستندات بعد — ابدأ برفع أول مستند.</div>
-      {% endif %}
-    </div>
-    <div class="footer">DocuAI © 2026 — Intelligent Project Document Management & Business Intelligence</div>
-  </section>
-</main>
-
-<script>
-function showNames(input){
-  document.getElementById('names').textContent = [...input.files].map(x=>x.name).join(' • ');
-}
-function filterTable(q){
-  const rows=document.querySelectorAll('#docsTable tbody tr');
-  rows.forEach(r=>r.style.display=r.innerText.toLowerCase().includes(q.toLowerCase())?'':'none');
-}
-const drop=document.getElementById('drop');
-if(drop){
- ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,()=>drop.classList.add('drag')));
- ['dragleave','drop'].forEach(e=>drop.addEventListener(e,()=>drop.classList.remove('drag')));
-}
-</script>
-</body>
-</html>
-"""
-
-UPLOAD_TEMPLATE = PAGE_TEMPLATE.replace(
-    '<h1>لوحة التحكم</h1><p>مرحباً بك في DocuAI — نظام إدارة وتحليل المستندات الذكي</p>',
-    '<h1>رفع المستندات</h1><p>ارفع ملفات المشروع ليتم استخراج بياناتها وتحليلها تلقائياً</p>'
-)
-
-DOCUMENTS_TEMPLATE = PAGE_TEMPLATE.replace(
-    '<h1>لوحة التحكم</h1><p>مرحباً بك في DocuAI — نظام إدارة وتحليل المستندات الذكي</p>',
-    '<h1>إدارة المستندات</h1><p>البحث واستعراض نتائج تحليل المستندات</p>'
-)
-
-
-def render_page(template=PAGE_TEMPLATE):
-    results = DOCUMENTS if False else LAST_RESULTS
-    high = sum(1 for r in DOCUMENTS if r.confidence == "High")
-    return render_template_string(
-        template,
-        results=results[-20:][::-1],
-        total=len(DOCUMENTS),
-        analyzed=len(DOCUMENTS),
-        high=high,
-        today=len(DOCUMENTS),
-        types=[
-            "RFI", "Submittal", "Shop Drawing", "Method Statement",
-            "Inspection Request", "NCR", "Transmittal", "Correspondence"
-        ],
+def audit(action, entity_type="", entity_id=None, details=""):
+    u = current_user()
+    con = db()
+    con.execute(
+        "INSERT INTO audit_log(user_id,action,entity_type,entity_id,details,created_at) VALUES(?,?,?,?,?,?)",
+        (u["id"] if u else None, action, entity_type, entity_id, details, now())
     )
+    con.commit()
+    con.close()
 
+def notify(user_id, title, message):
+    con = db()
+    con.execute(
+        "INSERT INTO notifications(user_id,title,message,created_at) VALUES(?,?,?,?)",
+        (user_id, title, message, now())
+    )
+    con.commit()
+    con.close()
 
-def process_uploaded_files(files):
-    global LAST_RESULTS, DOCUMENTS
-    new_results = []
-    for f in files:
-        if not f or not f.filename:
-            continue
-        safe_name = secure_filename(f.filename)
-        if not safe_name:
-            continue
-        save_path = UPLOAD_DIR / safe_name
-        f.save(save_path)
-        try:
-            text = read_any(str(save_path))
-            extracted = extract_fields(text, source_file=f.filename)
-            new_results.append(extracted)
-        except Exception as e:
-            print(f"خطأ في معالجة {f.filename}: {e}")
-    if new_results:
-        LAST_RESULTS = new_results
-        DOCUMENTS.extend(new_results)
-    return new_results
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+    return wrapped
 
+def role_required(*roles):
+    def deco(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            u = current_user()
+            if not u:
+                return redirect(url_for("login"))
+            if u["role"] not in roles:
+                flash("ليس لديك صلاحية لتنفيذ هذا الإجراء.", "error")
+                return redirect(url_for("dashboard"))
+            return view(*args, **kwargs)
+        return wrapped
+    return deco
 
+def allowed_file(name):
+    return Path(name).suffix.lower() in ALLOWED_EXTENSIONS
 
-@app.route("/analytics", methods=["GET", "POST"])
-def analytics_dashboard():
-    global DATASET_INFO
+# ---------- UI ----------
 
+CSS = """
+:root{--primary:#123b63;--secondary:#1e5b8d;--bg:#f3f6fa;--card:#fff;--text:#17212b;--muted:#6b7785;--border:#e1e7ee;--ok:#198754;--warn:#d99000;--bad:#c0392b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Tahoma,Arial,sans-serif}
+a{text-decoration:none;color:inherit}.top{height:64px;background:var(--primary);color:white;display:flex;align-items:center;justify-content:space-between;padding:0 24px;position:sticky;top:0;z-index:10}
+.brand{font-size:21px;font-weight:800}.brand small{font-size:11px;opacity:.7;margin-right:8px}.top-actions{display:flex;gap:14px;align-items:center}.icon{font-size:20px}
+.layout{display:flex;min-height:calc(100vh - 64px)}.side{width:245px;background:#fff;border-left:1px solid var(--border);padding:18px 12px}.side a{display:block;padding:11px 13px;border-radius:9px;margin:4px 0;color:#334455}.side a:hover,.side a.active{background:#eaf2f8;color:var(--primary);font-weight:700}
+.main{flex:1;padding:26px;max-width:1500px}.page-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.page-title h1{margin:0;font-size:27px}.muted{color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.card{background:var(--card);border:1px solid var(--border);border-radius:13px;padding:20px;box-shadow:0 3px 12px rgba(20,50,80,.05);margin-bottom:18px}.metric{font-size:29px;font-weight:800;margin-top:8px}.metric-label{color:var(--muted);font-size:13px}
+table{width:100%;border-collapse:collapse}th,td{padding:11px;border-bottom:1px solid var(--border);text-align:right;font-size:13px}th{background:#f7f9fb;color:#415468}
+.btn{display:inline-block;border:0;border-radius:8px;padding:9px 15px;background:var(--primary);color:#fff;cursor:pointer;font-weight:600}.btn.secondary{background:#e8eef4;color:var(--primary)}.btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.bad{background:var(--bad)}
+input,select,textarea{width:100%;padding:10px;border:1px solid #ccd6e0;border-radius:8px;background:white;font:inherit}label{font-size:13px;font-weight:700;display:block;margin:10px 0 5px}.form-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.badge{display:inline-block;padding:4px 9px;border-radius:20px;background:#e9eef3;font-size:11px}.badge.ok{background:#dff3e8;color:#176a3a}.badge.warn{background:#fff0d2;color:#8b5a00}.badge.bad{background:#fde2df;color:#9e281e}
+.flash{padding:11px 14px;border-radius:8px;margin-bottom:12px;background:#e9eef3}.flash.error{background:#fde2df;color:#9e281e}
+.chartbar{height:16px;background:#dfe7ef;border-radius:10px;overflow:hidden}.chartbar span{display:block;height:100%;background:var(--secondary)}
+.login{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#123b63,#1f6d9d)}.login-card{width:390px;background:white;border-radius:16px;padding:30px;box-shadow:0 20px 60px rgba(0,0,0,.2)}
+@media(max-width:900px){.side{display:none}.grid{grid-template-columns:repeat(2,1fr)}.main{padding:15px}.form-grid{grid-template-columns:1fr}}
+@media(max-width:600px){.grid{grid-template-columns:1fr}.top{padding:0 12px}.brand{font-size:17px}}
+"""
+
+def shell(title, body, active="dashboard"):
+    u = current_user()
+    if not u:
+        return body
+    con = db()
+    unread = con.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (u["id"],)).fetchone()[0]
+    con.close()
+    nav = [
+        ("dashboard","🏠 Dashboard","dashboard"),
+        ("documents","📁 Documents","documents"),
+        ("projects","🏗️ Projects","projects"),
+        ("transmittals","📨 Transmittals","transmittals"),
+        ("rfis","❓ RFIs","rfis"),
+        ("submittals","📋 Submittals","submittals"),
+        ("ai_ocr","🤖 AI / OCR","ai_ocr"),
+        ("analytics","📊 Analytics / BI","analytics"),
+        ("notifications","🔔 Notifications","notifications"),
+        ("users","👥 Users","users"),
+        ("audit","🕒 Audit Trail","audit"),
+        ("storage","💾 Storage","storage"),
+        ("search_pro","🔎 Smart Search","smart_search"),
+        ("revisions","🧬 Revisions","revisions"),
+        ("tasks","⏱️ My Tasks","tasks"),
+        ("messages","✉️ Internal Mail","messages"),
+        ("settings","⚙️ Settings","settings"),
+    ]
+    side = "".join(
+        f'<a class="{"active" if active==key else ""}" href="{url_for(route)}">{label}</a>'
+        for key,label,route in nav
+    )
+    return f"""<!doctype html><html lang="ar" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — MD DocuAI</title><style>{CSS}</style></head><body>
+<header class="top"><div class="brand">◈ MD DocuAI <small>PROJECT PLATFORM</small></div>
+<div class="top-actions"><a class="icon" href="{url_for('notifications')}">🔔 {unread}</a>
+<span>👤 {u['full_name']} · {u['role']}</span><a class="btn secondary" href="{url_for('logout')}">Logout</a></div></header>
+<div class="layout"><aside class="side">{side}</aside><main class="main">
+{"".join(f'<div class="flash {"error" if cat=="error" else ""}">{msg}</div>' for cat,msg in get_flashed_messages(with_categories=True))}
+{body}</main></div></body></html>"""
+
+# Flask helper imported through template context manually.
+from flask import get_flashed_messages
+
+# ---------- Authentication ----------
+
+LOGIN_HTML = """<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>MD DocuAI Login</title>
+<style>{CSS}</style></head><body><div class="login"><div class="login-card">
+<div style="text-align:center;font-size:34px">◈</div><h1 style="text-align:center;margin:8px 0">MD DocuAI</h1>
+<p class="muted" style="text-align:center">Intelligent Project Document Management</p>
+<form method="post">
+<label>Username</label><input name="username" required autofocus>
+<label>Password</label><div style="position:relative"><input id="pw" name="password" type="password" required style="padding-left:45px">
+<button type="button" onclick="togglePw()" style="position:absolute;left:4px;top:4px;border:0;background:transparent;font-size:20px">👁️</button></div>
+<button class="btn" style="width:100%;margin-top:18px">🔐 Login</button></form>
+<p class="muted" style="font-size:12px;margin-top:18px">Initial administrator: admin / Admin@123 — change it after first login.</p>
+</div></div><script>function togglePw(){let x=document.getElementById('pw');x.type=x.type==='password'?'text':'password'}</script></body></html>""".replace("{CSS}", CSS)
+
+@app.route("/login", methods=["GET","POST"])
+def login():
     if request.method == "POST":
-        f = request.files.get("data_file")
-        if f and f.filename:
-            safe_name = secure_filename(f.filename)
-            path = UPLOAD_DIR / safe_name
+        con=db()
+        u=con.execute("SELECT * FROM users WHERE username=? AND active=1",(request.form.get("username","").strip(),)).fetchone()
+        con.close()
+        if u and check_password_hash(u["password_hash"], request.form.get("password","")):
+            session["user_id"]=u["id"]
+            audit("LOGIN","user",u["id"],"Successful login")
+            return redirect(url_for("dashboard"))
+        flash("بيانات الدخول غير صحيحة.", "error")
+    return render_template_string(LOGIN_HTML)
+
+@app.route("/logout")
+def logout():
+    if current_user(): audit("LOGOUT","user",current_user()["id"],"Logout")
+    session.clear()
+    return redirect(url_for("login"))
+
+# ---------- Dashboard ----------
+
+@app.route("/")
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    u=current_user(); con=db()
+    where="WHERE company_id=?"; args=[u["company_id"]]
+    counts={
+        "documents":con.execute(f"SELECT COUNT(*) FROM documents {where}",args).fetchone()[0],
+        "projects":con.execute(f"SELECT COUNT(*) FROM projects {where}",args).fetchone()[0],
+        "rfis":con.execute(f"SELECT COUNT(*) FROM rfis {where}",args).fetchone()[0],
+        "submittals":con.execute(f"SELECT COUNT(*) FROM submittals {where}",args).fetchone()[0],
+        "transmittals":con.execute(f"SELECT COUNT(*) FROM transmittals {where}",args).fetchone()[0],
+    }
+    recent=con.execute("""SELECT d.*,p.name project_name FROM documents d
+        LEFT JOIN projects p ON p.id=d.project_id WHERE d.company_id=? ORDER BY d.id DESC LIMIT 8""",(u["company_id"],)).fetchall()
+    con.close()
+    rows="".join(f"<tr><td>{r['filename']}</td><td>{r['document_number'] or '-'}</td><td>{r['document_type'] or '-'}</td><td>{r['revision'] or '-'}</td><td><span class='badge'>{r['workflow_status']}</span></td></tr>" for r in recent)
+    body=f"""<div class="page-title"><div><h1>Dashboard</h1><div class="muted">Project Control Center — {u['company_name']}</div></div>
+<a class="btn" href="{url_for('documents')}">＋ Upload Documents</a></div>
+<div class="grid">{"".join(f"<div class='card'><div class='metric-label'>{k.title()}</div><div class='metric'>{v}</div></div>" for k,v in counts.items())}</div>
+<div class="card"><h3>Recent Documents</h3><table><tr><th>File</th><th>Document No.</th><th>Type</th><th>Revision</th><th>Workflow</th></tr>{rows or '<tr><td colspan=5>No documents yet</td></tr>'}</table></div>"""
+    return render_template_string(shell("Dashboard",body,"dashboard"))
+
+# ---------- Documents + OCR ----------
+
+@app.route("/documents", methods=["GET","POST"])
+@login_required
+def documents():
+    u=current_user()
+    if request.method=="POST":
+        project_id=request.form.get("project_id") or None
+        files=request.files.getlist("files")
+        saved=0
+        for f in files:
+            if not f or not f.filename or not allowed_file(f.filename):
+                continue
+            safe=secure_filename(f.filename)
+            uid=secrets.token_hex(8)
+            stored=f"{uid}_{safe}"
+            path=STORAGE_DIR/stored
             f.save(path)
             try:
-                df, summary = analyze_tabular_file(str(path))
-                DATASET_INFO = {
-                    "name": f.filename,
-                    "summary": summary,
-                    "preview": df.head(25).fillna("").to_dict("records"),
-                    "columns": df.columns.tolist(),
-                }
-            except Exception as e:
-                return f"تعذر تحليل الملف: {e}", 400
+                txt=read_any(str(path))
+                result=extract_fields(txt,safe)
+                ocr_used=1 if path.suffix.lower()==".pdf" and len(txt.strip())>0 else 0
+            except Exception as exc:
+                result=ExtractedDocument(safe,None,None,None,None,None,None,"Low")
+                ocr_used=0
+                flash(f"تعذر تحليل {safe}: {exc}","error")
+            con=db()
+            con.execute("""INSERT INTO documents
+                (company_id,project_id,uid,filename,stored_name,document_number,document_type,issue_date,
+                 revision,status,sender,confidence,ocr_used,workflow_status,file_size,uploaded_by,created_at,updated_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (u["company_id"],project_id,uid,safe,stored,result.document_number,result.document_type,
+                 result.date,result.revision,result.status or "Uploaded",result.sender,result.confidence,
+                 ocr_used,"Draft",path.stat().st_size,u["id"],now(),now()))
+            con.commit()
+            doc_id=con.execute("SELECT id FROM documents WHERE uid=?",(uid,)).fetchone()["id"]
+            con.close()
+            audit("UPLOAD","document",doc_id,safe)
+            saved+=1
+        if saved: flash(f"تم رفع وتحليل {saved} مستند.")
+        return redirect(url_for("documents"))
+    q=request.args.get("q","").strip()
+    con=db()
+    projects=con.execute("SELECT * FROM projects WHERE company_id=? ORDER BY name",(u["company_id"],)).fetchall()
+    if q:
+        docs=con.execute("""SELECT d.*,p.name project_name FROM documents d LEFT JOIN projects p ON p.id=d.project_id
+            WHERE d.company_id=? AND (d.filename LIKE ? OR d.document_number LIKE ? OR d.document_type LIKE ? OR d.sender LIKE ?)
+            ORDER BY d.id DESC""",(u["company_id"],f"%{q}%",f"%{q}%",f"%{q}%",f"%{q}%")).fetchall()
+    else:
+        docs=con.execute("""SELECT d.*,p.name project_name FROM documents d LEFT JOIN projects p ON p.id=d.project_id
+            WHERE d.company_id=? ORDER BY d.id DESC LIMIT 100""",(u["company_id"],)).fetchall()
+    con.close()
+    opts="".join(f"<option value='{p['id']}'>{p['code']} — {p['name']}</option>" for p in projects)
+    rows="".join(f"""<tr><td>{r['filename']}</td><td>{r['document_number'] or '-'}</td><td>{r['document_type'] or '-'}</td>
+<td>{r['issue_date'] or '-'}</td><td>{r['revision'] or '-'}</td><td>{r['status'] or '-'}</td><td>{r['sender'] or '-'}</td>
+<td><span class='badge'>{r['workflow_status']}</span></td><td><a class='btn secondary' href='{url_for('download',uid=r['uid'])}'>Download</a></td></tr>""" for r in docs)
+    body=f"""<div class="page-title"><div><h1>Documents</h1><div class="muted">Document Register + OCR + Revision + Workflow</div></div></div>
+<div class="card"><form method="post" enctype="multipart/form-data"><div class="form-grid">
+<div><label>Project</label><select name="project_id"><option value="">General / Unassigned</option>{opts}</select></div>
+<div><label>PDF / DOCX / TXT</label><input type="file" name="files" multiple required></div></div>
+<button class="btn" style="margin-top:14px">🤖 Upload + AI/OCR Analysis</button></form></div>
+<div class="card"><form method="get"><div class="form-grid"><input name="q" value="{q}" placeholder="Search document number, type, sender, filename..."><button class="btn secondary">🔎 Search</button></div></form>
+<table><tr><th>File</th><th>No.</th><th>Type</th><th>Date</th><th>Rev.</th><th>Status</th><th>Sender</th><th>Workflow</th><th>Action</th></tr>{rows or '<tr><td colspan=9>No documents</td></tr>'}</table></div>"""
+    return render_template_string(shell("Documents",body,"documents"))
 
-    s = DATASET_INFO.get("summary") or {}
-    preview = DATASET_INFO.get("preview") or []
-    columns = DATASET_INFO.get("columns") or []
+@app.route("/download/<uid>")
+@login_required
+def download(uid):
+    u=current_user(); con=db()
+    r=con.execute("SELECT * FROM documents WHERE uid=? AND company_id=?",(uid,u["company_id"])).fetchone()
+    con.close()
+    if not r: return "Not found",404
+    path=STORAGE_DIR/r["stored_name"]
+    if not path.exists(): return "File missing",404
+    audit("DOWNLOAD","document",r["id"],r["filename"])
+    return send_file(path,as_attachment=True,download_name=r["filename"])
 
-    return render_template_string(ANALYTICS_TEMPLATE,
-        dataset_name=DATASET_INFO.get("name"),
-        rows=s.get("rows", 0),
-        cols=s.get("columns", 0),
-        missing=s.get("missing_cells", 0),
-        total_sales=s.get("total_sales"),
-        total_quantity=s.get("total_quantity"),
-        columns=columns,
-        preview=preview,
-        powerbi_ready=bool(DATASET_INFO.get("name"))
+@app.route("/ai-ocr")
+@login_required
+def ai_ocr():
+    body="""<div class="page-title"><div><h1>AI / OCR</h1><div class="muted">Intelligent document extraction engine</div></div></div>
+<div class="card"><h3>Supported extraction</h3><div class="grid">
+<div><b>Document Number</b><p class="muted">Regex + project document patterns</p></div>
+<div><b>Document Type</b><p class="muted">RFI, Submittal, Drawing, Method Statement, etc.</p></div>
+<div><b>Issue Date / Revision</b><p class="muted">Automatic normalization</p></div>
+<div><b>Status / Sender</b><p class="muted">Keyword-based extraction</p></div></div>
+<p>استخدم صفحة Documents لرفع الملفات. ملفات PDF المصورة تستخدم Tesseract OCR عند الحاجة.</p></div>"""
+    return render_template_string(shell("AI / OCR",body,"ai_ocr"))
+
+# ---------- Projects ----------
+
+@app.route("/projects",methods=["GET","POST"])
+@login_required
+@role_required("Administrator","Manager","Editor")
+def projects():
+    u=current_user(); con=db()
+    if request.method=="POST":
+        name=request.form.get("name","").strip(); code=request.form.get("code","").strip().upper()
+        client=request.form.get("client","").strip()
+        if name and code:
+            try:
+                con.execute("INSERT INTO projects(company_id,name,code,client,created_at) VALUES(?,?,?,?,?)",(u["company_id"],name,code,client,now()))
+                con.commit(); flash("تم إنشاء المشروع."); audit("CREATE","project",None,f"{code} {name}")
+            except sqlite3.IntegrityError: flash("رمز المشروع موجود بالفعل.","error")
+    rows=con.execute("SELECT * FROM projects WHERE company_id=? ORDER BY id DESC",(u["company_id"],)).fetchall(); con.close()
+    tr="".join(f"<tr><td>{r['code']}</td><td>{r['name']}</td><td>{r['client'] or '-'}</td><td>{r['status']}</td><td>{r['created_at']}</td></tr>" for r in rows)
+    body=f"""<div class="page-title"><div><h1>Projects</h1></div></div>
+<div class="card"><form method="post"><div class="form-grid"><div><label>Project Name</label><input name="name" required></div><div><label>Project Code</label><input name="code" required></div><div><label>Client</label><input name="client"></div></div><button class="btn" style="margin-top:12px">＋ Create Project</button></form></div>
+<div class="card"><table><tr><th>Code</th><th>Project</th><th>Client</th><th>Status</th><th>Created</th></tr>{tr}</table></div>"""
+    return render_template_string(shell("Projects",body,"projects"))
+
+# ---------- Transmittals / RFIs / Submittals ----------
+
+def module_page(kind):
+    u=current_user(); con=db()
+    meta={
+      "transmittals":("Transmittals","number,subject,to_company","number,subject,to_company","Draft"),
+      "rfis":("RFIs","number,subject,question","number,subject,question","Open"),
+      "submittals":("Submittals","number,title,type","number,title,type","Submitted")
+    }[kind]
+    table=kind
+    if request.method=="POST":
+        project_id=request.form.get("project_id") or None
+        if kind=="transmittals":
+            con.execute("INSERT INTO transmittals(company_id,project_id,number,subject,to_company,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (u["company_id"],project_id,request.form["number"],request.form["subject"],request.form.get("to_company"),"Draft",u["id"],now()))
+        elif kind=="rfis":
+            con.execute("INSERT INTO rfis(company_id,project_id,number,subject,question,status,priority,due_date,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (u["company_id"],project_id,request.form["number"],request.form["subject"],request.form.get("question"),"Open",request.form.get("priority","Normal"),request.form.get("due_date"),u["id"],now()))
+        else:
+            con.execute("INSERT INTO submittals(company_id,project_id,number,title,type,status,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (u["company_id"],project_id,request.form["number"],request.form["title"],request.form.get("type"),"Submitted",request.form.get("revision"),u["id"],now()))
+        con.commit(); flash(f"تم إنشاء {meta[0]} بنجاح."); audit("CREATE",kind,None,request.form.get("number",""))
+    projects=con.execute("SELECT * FROM projects WHERE company_id=? ORDER BY name",(u["company_id"],)).fetchall()
+    data=con.execute(f"SELECT * FROM {table} WHERE company_id=? ORDER BY id DESC",(u["company_id"],)).fetchall(); con.close()
+    opts="".join(f"<option value='{p['id']}'>{p['code']} — {p['name']}</option>" for p in projects)
+    if kind=="transmittals":
+        fields=f"""<div><label>Number</label><input name="number" required></div><div><label>Subject</label><input name="subject" required></div><div><label>To Company</label><input name="to_company"></div>"""
+        head="<th>No.</th><th>Subject</th><th>To</th><th>Status</th><th>Created</th>"
+        tr="".join(f"<tr><td>{r['number']}</td><td>{r['subject']}</td><td>{r['to_company'] or '-'}</td><td>{r['status']}</td><td>{r['created_at']}</td></tr>" for r in data)
+    elif kind=="rfis":
+        fields=f"""<div><label>Number</label><input name="number" required></div><div><label>Subject</label><input name="subject" required></div><div><label>Question</label><textarea name="question"></textarea></div><div><label>Priority</label><select name="priority"><option>Normal</option><option>High</option><option>Critical</option></select></div><div><label>Due Date</label><input name="due_date" type="date"></div>"""
+        head="<th>No.</th><th>Subject</th><th>Priority</th><th>Status</th><th>Due</th>"
+        tr="".join(f"<tr><td>{r['number']}</td><td>{r['subject']}</td><td>{r['priority']}</td><td>{r['status']}</td><td>{r['due_date'] or '-'}</td></tr>" for r in data)
+    else:
+        fields=f"""<div><label>Number</label><input name="number" required></div><div><label>Title</label><input name="title" required></div><div><label>Type</label><input name="type"></div><div><label>Revision</label><input name="revision"></div>"""
+        head="<th>No.</th><th>Title</th><th>Type</th><th>Revision</th><th>Status</th>"
+        tr="".join(f"<tr><td>{r['number']}</td><td>{r['title']}</td><td>{r['type'] or '-'}</td><td>{r['revision'] or '-'}</td><td>{r['status']}</td></tr>" for r in data)
+    body=f"""<div class="page-title"><h1>{meta[0]}</h1></div><div class="card"><form method="post"><div class="form-grid"><div><label>Project</label><select name="project_id"><option value="">General</option>{opts}</select></div>{fields}</div><button class="btn" style="margin-top:12px">＋ Create</button></form></div>
+<div class="card"><table><tr>{head}</tr>{tr or '<tr><td colspan=6>No records</td></tr>'}</table></div>"""
+    return render_template_string(shell(meta[0],body,kind))
+
+@app.route("/transmittals",methods=["GET","POST"])
+@login_required
+@role_required("Administrator","Manager","Editor")
+def transmittals(): return module_page("transmittals")
+
+@app.route("/rfis",methods=["GET","POST"])
+@login_required
+@role_required("Administrator","Manager","Editor")
+def rfis(): return module_page("rfis")
+
+@app.route("/submittals",methods=["GET","POST"])
+@login_required
+@role_required("Administrator","Manager","Editor")
+def submittals(): return module_page("submittals")
+
+# ---------- Workflow ----------
+
+@app.route("/workflow/<int:doc_id>/<action>",methods=["POST"])
+@login_required
+@role_required("Administrator","Manager","Editor")
+def workflow_action(doc_id,action):
+    allowed={"submit":"Submitted","review":"Under Review","approve":"Approved","reject":"Rejected","revise":"Revision Required","close":"Closed"}
+    if action not in allowed: return "Invalid action",400
+    u=current_user(); con=db()
+    d=con.execute("SELECT * FROM documents WHERE id=? AND company_id=?",(doc_id,u["company_id"])).fetchone()
+    if not d: con.close(); return "Not found",404
+    new=allowed[action]
+    con.execute("UPDATE documents SET workflow_status=?,updated_at=? WHERE id=?",(new,now(),doc_id))
+    con.execute("INSERT INTO workflow(document_id,action,from_status,to_status,comment,user_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                (doc_id,action,d["workflow_status"],new,request.form.get("comment"),u["id"],now()))
+    con.commit(); con.close(); audit("WORKFLOW","document",doc_id,f"{d['workflow_status']} -> {new}")
+    return redirect(url_for("documents"))
+
+# ---------- Analytics / BI ----------
+
+@app.route("/analytics")
+@login_required
+def analytics():
+    u=current_user(); con=db()
+    total=con.execute("SELECT COUNT(*) FROM documents WHERE company_id=?",(u["company_id"],)).fetchone()[0]
+    types=con.execute("""SELECT COALESCE(document_type,'Unknown') label,COUNT(*) n FROM documents
+                         WHERE company_id=? GROUP BY document_type ORDER BY n DESC LIMIT 10""",(u["company_id"],)).fetchall()
+    statuses=con.execute("""SELECT workflow_status label,COUNT(*) n FROM documents
+                            WHERE company_id=? GROUP BY workflow_status ORDER BY n DESC""",(u["company_id"],)).fetchall()
+    conf=con.execute("""SELECT COALESCE(confidence,'Unknown') label,COUNT(*) n FROM documents
+                        WHERE company_id=? GROUP BY confidence""",(u["company_id"],)).fetchall()
+    con.close()
+    def bars(rows):
+        mx=max([r["n"] for r in rows] or [1])
+        return "".join(f"<div style='margin:9px 0'><div style='display:flex;justify-content:space-between'><span>{r['label']}</span><b>{r['n']}</b></div><div class='chartbar'><span style='width:{r['n']/mx*100:.1f}%'></span></div></div>" for r in rows)
+    body=f"""<div class="page-title"><div><h1>Analytics / BI</h1><div class="muted">Operational project intelligence</div></div></div>
+<div class="grid"><div class="card"><div class="metric-label">Total Documents</div><div class="metric">{total}</div></div>
+<div class="card"><div class="metric-label">Document Types</div><div class="metric">{len(types)}</div></div>
+<div class="card"><div class="metric-label">Workflow States</div><div class="metric">{len(statuses)}</div></div>
+<div class="card"><div class="metric-label">Confidence Levels</div><div class="metric">{len(conf)}</div></div></div>
+<div class="grid"><div class="card"><h3>Documents by Type</h3>{bars(types) or '<p class="muted">No data</p>'}</div>
+<div class="card"><h3>Workflow Status</h3>{bars(statuses) or '<p class="muted">No data</p>'}</div></div>
+<div class="card"><h3>Extraction Confidence</h3>{bars(conf) or '<p class="muted">No data</p>'}</div>"""
+    return render_template_string(shell("Analytics",body,"analytics"))
+
+# ---------- Notifications ----------
+
+@app.route("/notifications")
+@login_required
+def notifications():
+    u=current_user(); con=db()
+    rows=con.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 100",(u["id"],)).fetchall()
+    con.execute("UPDATE notifications SET is_read=1 WHERE user_id=?",(u["id"],)); con.commit(); con.close()
+    tr="".join(f"<tr><td>{r['created_at']}</td><td>{r['title']}</td><td>{r['message']}</td></tr>" for r in rows)
+    body=f"""<div class="page-title"><h1>Notifications</h1></div><div class="card"><table><tr><th>Date</th><th>Title</th><th>Message</th></tr>{tr or '<tr><td colspan=3>No notifications</td></tr>'}</table></div>"""
+    return render_template_string(shell("Notifications",body,"notifications"))
+
+# ---------- Users / Companies ----------
+
+@app.route("/users",methods=["GET","POST"])
+@login_required
+@role_required("Administrator")
+def users():
+    u=current_user(); con=db()
+    if request.method=="POST":
+        username=request.form["username"].strip(); full=request.form["full_name"].strip()
+        role=request.form.get("role","Viewer"); pw=request.form["password"]
+        try:
+            con.execute("""INSERT INTO users(company_id,username,password_hash,full_name,role,created_at)
+                           VALUES(?,?,?,?,?,?)""",(u["company_id"],username,generate_password_hash(pw),full,role,now()))
+            con.commit(); flash("تم إنشاء المستخدم.")
+            audit("CREATE","user",None,username)
+        except sqlite3.IntegrityError: flash("اسم المستخدم موجود بالفعل.","error")
+    rows=con.execute("SELECT * FROM users WHERE company_id=? ORDER BY id DESC",(u["company_id"],)).fetchall(); con.close()
+    tr="".join(f"<tr><td>{r['username']}</td><td>{r['full_name']}</td><td>{r['role']}</td><td>{'Active' if r['active'] else 'Inactive'}</td></tr>" for r in rows)
+    body=f"""<div class="page-title"><h1>Users & Permissions</h1></div><div class="card"><form method="post"><div class="form-grid">
+<div><label>Username</label><input name="username" required></div><div><label>Full Name</label><input name="full_name" required></div>
+<div><label>Password</label><input name="password" type="password" required></div><div><label>Role</label><select name="role"><option>Administrator</option><option>Manager</option><option>Editor</option><option>Viewer</option></select></div>
+</div><button class="btn" style="margin-top:12px">＋ Create User</button></form></div>
+<div class="card"><table><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th></tr>{tr}</table></div>"""
+    return render_template_string(shell("Users",body,"users"))
+
+# ---------- Audit / Storage ----------
+
+@app.route("/audit")
+@login_required
+@role_required("Administrator","Manager")
+def audit_page():
+    u=current_user(); con=db()
+    rows=con.execute("""SELECT a.*,u.username FROM audit_log a LEFT JOIN users u ON u.id=a.user_id
+                        WHERE u.company_id=? ORDER BY a.id DESC LIMIT 200""",(u["company_id"],)).fetchall(); con.close()
+    tr="".join(f"<tr><td>{r['created_at']}</td><td>{r['username'] or '-'}</td><td>{r['action']}</td><td>{r['entity_type']}</td><td>{r['details'] or ''}</td></tr>" for r in rows)
+    body=f"""<div class="page-title"><h1>Audit Trail</h1></div><div class="card"><table><tr><th>Date</th><th>User</th><th>Action</th><th>Entity</th><th>Details</th></tr>{tr}</table></div>"""
+    return render_template_string(shell("Audit",body,"audit"))
+
+@app.route("/storage")
+@login_required
+def storage():
+    u=current_user(); con=db()
+    total=con.execute("SELECT COALESCE(SUM(file_size),0) FROM documents WHERE company_id=?",(u["company_id"],)).fetchone()[0]
+    count=con.execute("SELECT COUNT(*) FROM documents WHERE company_id=?",(u["company_id"],)).fetchone()[0]; con.close()
+    body=f"""<div class="page-title"><h1>Storage</h1></div><div class="grid">
+<div class="card"><div class="metric-label">Stored Files</div><div class="metric">{count}</div></div>
+<div class="card"><div class="metric-label">Storage Used</div><div class="metric">{total/1024/1024:.2f} MB</div></div></div>
+<div class="card"><h3>Cloud-ready architecture</h3><p class="muted">النسخة الحالية تستخدم Local Storage. يمكن لاحقًا ربط S3/Azure Blob/Google Cloud Storage دون تغيير طبقة المستندات الأساسية.</p></div>"""
+    return render_template_string(shell("Storage",body,"storage"))
+
+
+# =============================================================================
+# V5-V18 PROFESSIONAL MODULES
+# =============================================================================
+
+@app.route("/smart-search")
+@login_required
+def smart_search():
+    u = current_user()
+    q = request.args.get("q","").strip()
+    con = db()
+    rows = []
+    if q:
+        like = f"%{q}%"
+        rows = con.execute("""
+            SELECT d.*, p.name AS project_name
+            FROM documents d LEFT JOIN projects p ON p.id=d.project_id
+            WHERE d.company_id=? AND (
+                d.filename LIKE ? OR d.document_number LIKE ? OR
+                d.document_type LIKE ? OR d.status LIKE ? OR
+                d.sender LIKE ? OR d.revision LIKE ?
+            )
+            ORDER BY d.id DESC LIMIT 300
+        """,(u["company_id"],like,like,like,like,like,like)).fetchall()
+    con.close()
+    tr = "".join(
+        f"<tr><td>{r['filename']}</td><td>{r['document_number'] or '-'}</td>"
+        f"<td>{r['project_name'] or '-'}</td><td>{r['document_type'] or '-'}</td>"
+        f"<td>{r['revision'] or '-'}</td><td>{r['status'] or '-'}</td>"
+        f"<td>{r['confidence'] or '-'}</td>"
+        f"<td><a class='btn secondary' href='{url_for('download',uid=r['uid'])}'>Open</a></td></tr>"
+        for r in rows
     )
+    body = f"""<div class="hero"><h1>Smart Search</h1>
+    <p>Search document number, type, project, revision, status, sender and filename.</p></div>
+    <div class="card"><form class="toolbar">
+    <div><label>Search</label><input name="q" value="{q}" placeholder="Example: DRG-001 / Approved / Drainage"></div>
+    <button class="btn">🔎 Search</button></form></div>
+    <div class="card table-wrap"><table><tr><th>File</th><th>Document No.</th><th>Project</th>
+    <th>Type</th><th>Revision</th><th>Status</th><th>AI Confidence</th><th>Action</th></tr>
+    {tr or '<tr><td colspan="8" class="empty">Enter a search term to begin.</td></tr>'}</table></div>"""
+    return render_template_string(shell("Smart Search",body,"search_pro"))
 
+@app.route("/revisions")
+@login_required
+def revisions():
+    u = current_user()
+    con = db()
+    rows = con.execute("""
+        SELECT r.*, d.filename, d.document_number, u.full_name
+        FROM document_revisions r
+        JOIN documents d ON d.id=r.document_id
+        LEFT JOIN users u ON u.id=r.created_by
+        WHERE d.company_id=? ORDER BY r.id DESC LIMIT 300
+    """,(u["company_id"],)).fetchall()
+    con.close()
+    tr = "".join(
+        f"<tr><td>{r['filename']}</td><td>{r['document_number'] or '-'}</td>"
+        f"<td><b>{r['revision']}</b></td><td>{r['status']}</td>"
+        f"<td>{r['change_summary'] or '-'}</td><td>{r['full_name'] or '-'}</td>"
+        f"<td>{r['created_at']}</td></tr>" for r in rows
+    )
+    body = f"""<div class="page-title"><div><h1>Revision Control</h1>
+    <div class="muted">Complete document version history and change tracking.</div></div></div>
+    <div class="card table-wrap"><table><tr><th>Document</th><th>Number</th><th>Revision</th>
+    <th>Status</th><th>Change Summary</th><th>Created By</th><th>Date</th></tr>
+    {tr or '<tr><td colspan="7" class="empty">No revisions recorded yet.</td></tr>'}</table></div>"""
+    return render_template_string(shell("Revisions",body,"revisions"))
 
-@app.route("/powerbi-dataset")
-def powerbi_dataset():
-    if not DOCUMENTS:
-        return "لا توجد بيانات مستندات بعد.", 400
-    output_path = UPLOAD_DIR / "docuai_powerbi_dataset.csv"
-    export_powerbi_dataset(str(output_path))
-    return send_file(output_path, as_attachment=True,
-                     download_name="docuai_powerbi_dataset.csv")
+@app.route("/tasks")
+@login_required
+def tasks():
+    u = current_user()
+    con = db()
+    rows = con.execute("""
+        SELECT t.*, d.filename, d.document_number
+        FROM workflow_tasks t JOIN documents d ON d.id=t.document_id
+        WHERE d.company_id=? AND t.assigned_to=?
+        ORDER BY CASE WHEN t.status='Pending' THEN 0 ELSE 1 END, t.due_date
+    """,(u["company_id"],u["id"])).fetchall()
+    con.close()
+    tr = "".join(
+        f"<tr><td>{r['document_number'] or r['filename']}</td><td>{r['stage']}</td>"
+        f"<td>{r['due_date'] or '-'}</td><td><span class='pill'>{r['status']}</span></td>"
+        f"<td>{r['decision'] or '-'}</td></tr>" for r in rows
+    )
+    body = f"""<div class="page-title"><div><h1>My Tasks</h1>
+    <div class="muted">Workflow assignments, review deadlines and decisions.</div></div></div>
+    <div class="card table-wrap"><table><tr><th>Document</th><th>Stage</th><th>Due Date</th>
+    <th>Status</th><th>Decision</th></tr>{tr or '<tr><td colspan="5" class="empty">No assigned tasks.</td></tr>'}</table></div>"""
+    return render_template_string(shell("My Tasks",body,"tasks"))
 
-
-@app.route("/", methods=["GET"])
-def index():
-    return render_page()
-
-
-@app.route("/upload", methods=["GET", "POST"])
-def upload():
+@app.route("/messages", methods=["GET","POST"])
+@login_required
+def messages():
+    u = current_user()
+    con = db()
     if request.method == "POST":
-        process_uploaded_files(request.files.getlist("files"))
-        return render_page()
-    return render_page(UPLOAD_TEMPLATE)
+        receiver = request.form.get("receiver_id")
+        subject = request.form.get("subject","").strip()
+        body_txt = request.form.get("body","").strip()
+        if receiver and subject and body_txt:
+            con.execute("""INSERT INTO internal_messages
+                (company_id,sender_id,receiver_id,subject,body,created_at)
+                VALUES(?,?,?,?,?,?)""",
+                (u["company_id"],u["id"],int(receiver),subject,body_txt,now()))
+            con.commit()
+            notify(int(receiver),"رسالة جديدة",subject)
+            audit("MESSAGE","internal_message",None,subject)
+            flash("تم إرسال الرسالة.")
+        return redirect(url_for("messages"))
+    users = con.execute("""SELECT id,full_name,username FROM users
+                           WHERE company_id=? AND id<>? AND active=1 ORDER BY full_name""",
+                        (u["company_id"],u["id"])).fetchall()
+    inbox = con.execute("""
+        SELECT m.*, s.full_name sender_name
+        FROM internal_messages m JOIN users s ON s.id=m.sender_id
+        WHERE m.receiver_id=? ORDER BY m.id DESC LIMIT 100
+    """,(u["id"],)).fetchall()
+    con.close()
+    opts = "".join(f"<option value='{r['id']}'>{r['full_name']} ({r['username']})</option>" for r in users)
+    tr = "".join(
+        f"<tr><td>{r['sender_name']}</td><td>{r['subject']}</td><td>{r['body']}</td>"
+        f"<td>{r['created_at']}</td></tr>" for r in inbox
+    )
+    body = f"""<div class="page-title"><div><h1>Internal Mail</h1>
+    <div class="muted">Project communication inside your company workspace.</div></div></div>
+    <div class="card"><form method="post"><div class="form-grid">
+    <div><label>To</label><select name="receiver_id" required>{opts}</select></div>
+    <div><label>Subject</label><input name="subject" required></div>
+    </div><label>Message</label><textarea name="body" rows="4" required></textarea>
+    <button class="btn" style="margin-top:12px">✉️ Send</button></form></div>
+    <div class="card table-wrap"><h3>Inbox</h3><table><tr><th>From</th><th>Subject</th>
+    <th>Message</th><th>Date</th></tr>{tr or '<tr><td colspan="4" class="empty">Inbox is empty.</td></tr>'}</table></div>"""
+    return render_template_string(shell("Internal Mail",body,"messages"))
+
+@app.route("/settings", methods=["GET","POST"])
+@login_required
+def settings():
+    u = current_user()
+    con = db()
+    if request.method == "POST":
+        secret = request.form.get("secret_key","").strip()
+        if secret:
+            # Store company-level configuration without exposing it in the UI.
+            con.execute("""INSERT INTO system_settings(company_id,setting_key,setting_value)
+                           VALUES(?,?,?) ON CONFLICT(company_id,setting_key)
+                           DO UPDATE SET setting_value=excluded.setting_value""",
+                        (u["company_id"],"workspace_secret_hint",secret[-4:]))
+            con.commit()
+            audit("SETTINGS","company",u["company_id"],"Workspace settings updated")
+            flash("تم تحديث الإعدادات.")
+        return redirect(url_for("settings"))
+    con.close()
+    body = """<div class="page-title"><div><h1>Settings</h1>
+    <div class="muted">Workspace configuration and deployment-ready controls.</div></div></div>
+    <div class="card"><h3>Platform</h3>
+    <div class="ai-field"><b>Product</b><span>MD DocuAI Professional</span></div>
+    <div class="ai-field"><b>Architecture</b><span>Flask + SQLite + Local/Cloud-ready Storage</span></div>
+    <div class="ai-field"><b>AI/OCR</b><span>Regex extraction + optional AI analysis + OCR engine</span></div>
+    <div class="ai-field"><b>API</b><span>REST API foundation with API-key authentication</span></div>
+    </div>
+    <div class="card"><h3>Production checklist</h3>
+    <p>Use a strong DOCUAI_SECRET_KEY, configure DOCUAI_API_KEY, move storage to object storage,
+    and put the application behind HTTPS before production use.</p></div>"""
+    return render_template_string(shell("Settings",body,"settings"))
+
+@app.route("/document/<int:doc_id>")
+@login_required
+def document_detail(doc_id):
+    u = current_user()
+    con = db()
+    d = con.execute("""SELECT d.*, p.name project_name FROM documents d
+                       LEFT JOIN projects p ON p.id=d.project_id
+                       WHERE d.id=? AND d.company_id=?""",(doc_id,u["company_id"])).fetchone()
+    if not d:
+        con.close()
+        return "Document not found",404
+    comments = con.execute("""SELECT c.*,u.full_name FROM document_comments c
+                               LEFT JOIN users u ON u.id=c.user_id
+                               WHERE c.document_id=? ORDER BY c.id DESC""",(doc_id,)).fetchall()
+    revisions = con.execute("""SELECT * FROM document_revisions
+                                WHERE document_id=? ORDER BY id DESC""",(doc_id,)).fetchall()
+    tasks_rows = con.execute("""SELECT t.*,u.full_name FROM workflow_tasks t
+                                LEFT JOIN users u ON u.id=t.assigned_to
+                                WHERE t.document_id=? ORDER BY t.id DESC""",(doc_id,)).fetchall()
+    ai = con.execute("""SELECT * FROM ai_analysis WHERE document_id=? ORDER BY id DESC LIMIT 1""",(doc_id,)).fetchone()
+    con.close()
+    rev_html = "".join(f"<li><b>{r['revision']}</b> — {r['status']} — {r['created_at']} — {r['change_summary'] or ''}</li>" for r in revisions)
+    task_html = "".join(f"<li><b>{r['stage']}</b> — {r['status']} — {r['due_date'] or 'No due date'} — {r['full_name'] or 'Unassigned'}</li>" for r in tasks_rows)
+    comment_html = "".join(f"<div class='card' style='margin:8px 0'><b>{r['full_name'] or 'User'}</b><br>{r['comment']}<br><small class='muted'>{r['created_at']}</small></div>" for r in comments)
+    ai_html = ""
+    if ai:
+        ai_html = f"""<div class="ai-box"><h3>🤖 AI Intelligence</h3>
+        <div class="ai-field"><b>Summary</b><span>{ai['summary'] or '-'}</span></div>
+        <div class="ai-field"><b>Key Points</b><span>{ai['key_points'] or '-'}</span></div>
+        <div class="ai-field"><b>Required Actions</b><span>{ai['required_actions'] or '-'}</span></div>
+        <div class="ai-field"><b>Risks</b><span>{ai['risks'] or '-'}</span></div>
+        <div class="ai-field"><b>Keywords</b><span>{ai['keywords'] or '-'}</span></div></div>"""
+    body = f"""<div class="page-title"><div><h1>{d['filename']}</h1>
+    <div class="muted">{d['document_number'] or 'No document number'} · {d['project_name'] or 'Unassigned project'}</div></div>
+    <a class="btn" href="{url_for('download',uid=d['uid'])}">⬇ Download</a></div>
+    <div class="card"><div class="form-grid">
+    <div><b>Type</b><div>{d['document_type'] or '-'}</div></div><div><b>Revision</b><div>{d['revision'] or '-'}</div></div>
+    <div><b>Status</b><div><span class="pill">{d['status'] or '-'}</span></div></div><div><b>Sender</b><div>{d['sender'] or '-'}</div></div>
+    <div><b>Issue Date</b><div>{d['issue_date'] or '-'}</div></div><div><b>AI Confidence</b><div>{d['confidence'] or '-'}</div></div>
+    </div></div>
+    {ai_html}
+    <div class="split"><div class="card"><h3>Workflow Timeline</h3><div class="timeline">{task_html or '<div class="empty">No workflow tasks yet.</div>'}</div></div>
+    <div class="card"><h3>Revision History</h3><ul>{rev_html or '<li class="empty">No revision history yet.</li>'}</ul></div></div>
+    <div class="card"><h3>Comments</h3>{comment_html or '<div class="empty">No comments yet.</div>'}</div>"""
+    return render_template_string(shell("Document Detail",body,"documents"))
+
+@app.route("/api/v1/search")
+def api_search():
+    if not api_auth():
+        return jsonify({"error":"API key required"}),401
+    q = request.args.get("q","").strip()
+    con = db()
+    like = f"%{q}%"
+    rows = con.execute("""SELECT id,uid,filename,document_number,document_type,revision,status,sender,confidence,created_at
+                          FROM documents
+                          WHERE filename LIKE ? OR document_number LIKE ? OR document_type LIKE ?
+                             OR status LIKE ? OR sender LIKE ? OR revision LIKE ?
+                          ORDER BY id DESC LIMIT 200""",(like,like,like,like,like,like)).fetchall()
+    con.close()
+    return jsonify({"query":q,"results":[dict(r) for r in rows]})
+
+@app.route("/api/v1/dashboard")
+def api_dashboard():
+    if not api_auth():
+        return jsonify({"error":"API key required"}),401
+    con = db()
+    data = {
+        "documents": con.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+        "projects": con.execute("SELECT COUNT(*) FROM projects").fetchone()[0],
+        "rfis": con.execute("SELECT COUNT(*) FROM rfis").fetchone()[0],
+        "submittals": con.execute("SELECT COUNT(*) FROM submittals").fetchone()[0],
+        "transmittals": con.execute("SELECT COUNT(*) FROM transmittals").fetchone()[0],
+        "approved": con.execute("SELECT COUNT(*) FROM documents WHERE status='Approved'").fetchone()[0],
+        "pending": con.execute("SELECT COUNT(*) FROM documents WHERE status IN ('Pending','For Review','For Approval')").fetchone()[0],
+    }
+    con.close()
+    return jsonify(data)
 
 
-@app.route("/documents", methods=["GET"])
-def documents():
-    return render_page(DOCUMENTS_TEMPLATE)
+# ---------- REST API (V4 foundation) ----------
 
+def api_auth():
+    token=request.headers.get("X-API-Key") or request.args.get("api_key")
+    expected=os.environ.get("DOCUAI_API_KEY")
+    return bool(expected and secrets.compare_digest(token or "",expected))
 
-@app.route("/reports", methods=["GET"])
-def reports():
-    if not DOCUMENTS:
-        return render_template_string(
-            PAGE_TEMPLATE,
-            results=[],
-            total=0, analyzed=0, high=0, today=0,
-            types=["RFI","Submittal","Shop Drawing","Method Statement",
-                   "Inspection Request","NCR","Transmittal","Correspondence"]
-        )
-    return render_page(DOCUMENTS_TEMPLATE)
+@app.route("/api/v1/health")
+def api_health():
+    return jsonify({"status":"ok","product":"MD DocuAI","version":"3.0-professional-single-file"})
 
+@app.route("/api/v1/documents")
+def api_documents():
+    if not api_auth(): return jsonify({"error":"API key required"}),401
+    con=db()
+    rows=con.execute("""SELECT id,uid,filename,document_number,document_type,issue_date,revision,status,
+                        sender,confidence,workflow_status,created_at FROM documents ORDER BY id DESC LIMIT 200""").fetchall()
+    con.close()
+    return jsonify({"documents":[dict(r) for r in rows]})
 
-@app.route("/download")
-def download():
-    if not LAST_RESULTS:
-        return "لا توجد نتائج بعد. الرجاء رفع مستندات أولاً.", 400
-    output_path = UPLOAD_DIR / "docuai_results.xlsx"
-    export_to_excel(LAST_RESULTS, str(output_path))
-    return send_file(output_path, as_attachment=True,
-                     download_name="docuai_results.xlsx")
+# ---------- Error handling / startup ----------
 
+@app.errorhandler(413)
+def too_large(e):
+    return "File too large. Maximum size is 25 MB.", 413
 
-def find_free_port(preferred=5000):
-    for port in [preferred] + list(range(5001, 5011)):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", port)) != 0:
-                return port
-    return preferred
-
-
-def open_browser(url):
-    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
-
+init_db()
 
 if __name__ == "__main__":
-    env_port = os.environ.get("PORT")
-    is_cloud = env_port is not None
-    port = int(env_port) if is_cloud else find_free_port(5000)
-    host = "0.0.0.0" if is_cloud else "127.0.0.1"
-    url = f"http://{host}:{port}"
-
-    print("=" * 60)
-    print("  DocuAI Professional UI جاهز للعمل ✅")
-    if not is_cloud:
-        print(f"  افتح المتصفح على: {url}")
-        print("  لإيقاف البرنامج اضغط CTRL+C")
-    print("=" * 60)
-
-    if not is_cloud:
-        open_browser(url)
-
-    app.run(debug=False, host=host, port=port)
+    port=int(os.environ.get("PORT","5000"))
+    app.run(host="0.0.0.0",port=port,debug=False)
